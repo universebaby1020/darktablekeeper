@@ -8,6 +8,7 @@ import re
 import secrets
 import threading
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, DecimalException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -84,16 +85,44 @@ def resolve(wall, zone):
 
 
 def canonical(value):
-    # JSON numeric equality does not depend on a decimal point; booleans remain distinct.
-    def normalize(v):
+    # Preserve JSON numbers without float overflow, underflow or precision loss.
+    # Normalize their spelling without rounding; booleans remain distinct from numbers.
+    def encode(v):
         if isinstance(v, dict):
-            return {k: normalize(x) for k, x in v.items()}
+            return '{' + ','.join(json.dumps(k) + ':' + encode(v[k]) for k in sorted(v)) + '}'
         if isinstance(v, list):
-            return [normalize(x) for x in v]
-        if type(v) is float and v.is_integer():
-            return int(v)
-        return v
-    return json.dumps(normalize(value), sort_keys=True, separators=(',', ':'), allow_nan=False)
+            return '[' + ','.join(encode(x) for x in v) + ']'
+        if type(v) in (int, float) or isinstance(v, Decimal):
+            number = v if isinstance(v, Decimal) else Decimal(str(v))
+            if not number.is_finite():
+                fail(400, 'malformed_request')
+            sign, digits, exponent = number.as_tuple()
+            coefficient = ''.join(str(d) for d in digits)
+            if not number:
+                return '0'
+            while coefficient.endswith('0'):
+                coefficient = coefficient[:-1]
+                exponent += 1
+            prefix = '-' if sign else ''
+            # Bound representation size, not numeric range; large exponents stay compact.
+            if 0 <= exponent <= 300:
+                return prefix + coefficient + '0' * exponent
+            if -300 <= exponent < 0:
+                point = len(coefficient) + exponent
+                if point > 0:
+                    return prefix + coefficient[:point] + '.' + coefficient[point:]
+                return prefix + '0.' + '0' * (-point) + coefficient
+            return prefix + coefficient + 'e' + str(exponent)
+        return json.dumps(v, allow_nan=False)
+    return encode(value)
+
+
+def parse_json(value):
+    try:
+        return json.loads(value, parse_float=Decimal,
+                          parse_constant=lambda _: fail(400, 'malformed_request'))
+    except DecimalException:
+        fail(400, 'malformed_request')
 
 
 def password_hash(password):
@@ -169,15 +198,13 @@ class Service:
         if not 1 <= len(key) <= 255:
             fail()
         index = canonical([uid, method, path, key])
+        serialized_body = canonical(body)
         saved = self.state['receipts'].get(index)
         if saved:
-            if saved['body'] != canonical(body):
+            if saved['body'] != serialized_body:
                 fail(409, 'idempotency_key_reuse')
-            return index, copy.deepcopy(saved['response'])
-        return index, None
-
-    def save_receipt(self, index, body, response):
-        self.state['receipts'][index] = {'body': canonical(body), 'response': copy.deepcopy(response)}
+            return index, serialized_body, copy.deepcopy(saved['response'])
+        return index, serialized_body, None
 
     def validated_booking(self, rid, fields):
         # Validate without modifying either occupancy or records.
@@ -326,7 +353,7 @@ class Service:
         uid = self.user(headers)
         if method == 'POST' and path in ('/reservations', '/reservation-moves'):
             self.object_body(body)
-            receipt, replay = self.receipt(method, path, uid, headers, body)
+            receipt, serialized_body, replay = self.receipt(method, path, uid, headers, body)
             if replay is not None:
                 return 200, replay
             if path == '/reservations':
@@ -338,7 +365,7 @@ class Service:
                     reference = secrets.token_hex(5).upper()
                 candidate.update(reservation_id='res_' + secrets.token_hex(12), reference=reference,
                                  status='confirmed', user_id=uid, created_at=datetime.now(UTC).isoformat(timespec='seconds'))
-                self.state['reservations'][reference] = candidate
+                candidates = [candidate]
                 response = self.public(candidate)
             else:
                 moves = body.get('moves')
@@ -361,10 +388,12 @@ class Service:
                 for i, candidate in enumerate(candidates):
                     if not self.available(candidate, references) or any(self.overlaps(candidate, earlier) for earlier in candidates[:i]):
                         fail(409, 'table_unavailable')
-                for candidate in candidates:
-                    self.state['reservations'][candidate['reference']] = candidate
                 response = {'reservations': [self.public(r) for r in candidates]}
-            self.save_receipt(receipt, body, response)
+            # Prepare all potentially failing receipt work before the transaction commits.
+            completed = {'body': serialized_body, 'response': copy.deepcopy(response)}
+            for candidate in candidates:
+                self.state['reservations'][candidate['reference']] = candidate
+            self.state['receipts'][receipt] = completed
             return 201, response
         if method == 'GET' and path == '/reservations':
             reservations = [r for r in self.state['reservations'].values() if r['user_id'] == uid]
@@ -515,12 +544,12 @@ class Service:
                         fail()
                     confirmed.append(res)
             for index, receipt in state['receipts'].items():
-                scope = json.loads(index)
+                scope = parse_json(index)
                 if not isinstance(scope, list) or len(scope) != 4 or scope[0] not in state['users'] or scope[1] != 'POST' or scope[2] not in ('/reservations', '/reservation-moves') or not isinstance(scope[3], str) or not 1 <= len(scope[3]) <= 255 or canonical(scope) != index:
                     fail()
                 if not isinstance(receipt, dict) or set(receipt) != {'body', 'response'} or not isinstance(receipt['body'], str):
                     fail()
-                request = json.loads(receipt['body'])
+                request = parse_json(receipt['body'])
                 if not isinstance(request, dict) or canonical(request) != receipt['body'] or not isinstance(receipt['response'], dict):
                     fail()
                 responses = [receipt['response']] if scope[2] == '/reservations' else receipt['response'].get('reservations')
@@ -571,7 +600,7 @@ class Handler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(size)
                 if raw:
                     try:
-                        body = json.loads(raw.decode('utf-8'), parse_constant=lambda _: fail(400, 'malformed_request'))
+                        body = parse_json(raw.decode('utf-8'))
                     except (ValueError, UnicodeDecodeError, RecursionError):
                         fail(400, 'malformed_request')
                 elif self.path.split('?')[0] != '/health' and not re.fullmatch(r'/reservations/[^/]+/cancel', self.path.split('?')[0]):

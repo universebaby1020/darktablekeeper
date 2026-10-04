@@ -36,6 +36,70 @@ class ReservationTests(unittest.TestCase):
         self.assertEqual(result[0], status)
         self.assertEqual(result[1]['error']['code'], code)
 
+    def http_write(self, path, raw, key):
+        request = ('POST ' + path + ' HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n'
+                   'Authorization: ' + self.headers['Authorization'] + '\r\nIdempotency-Key: ' + key +
+                   '\r\nContent-Length: ' + str(len(raw)) + '\r\n\r\n').encode() + raw
+        connection = MemoryConnection(request)
+        with patch.object(service, 'SERVICE', self.api):
+            service.Handler(connection, ('127.0.0.1', 1234), None)
+        head, body = connection.writer.getvalue().split(b'\r\n\r\n', 1)
+        return int(head.split(b' ')[1]), json.loads(body)
+
+    def test_large_json_number_in_unknown_create_field_commits_with_receipt(self):
+        raw = json.dumps(self.body).encode()[:-1] + b', "extra": 1e309}'
+        status, original = self.http_write('/reservations', raw, 'large')
+        self.assertEqual(status, 201)
+        self.assertEqual(len(self.api.state['reservations']), 1)
+        self.assertEqual(len(self.api.state['receipts']), 1)
+        self.assertEqual(self.http_write('/reservations', raw.replace(b'1e309', b'10e308'), 'large'), (200, original))
+        before = copy.deepcopy(self.api.state)
+        self.error(self.http_write('/reservations', raw.replace(b'1e309', b'1e310'), 'large'), 409, 'idempotency_key_reuse')
+        self.assertTrue(self.api.state == before)
+        exported = self.api.request('GET', '/_test/export')[1]
+        self.assertEqual(self.api.request('POST', '/_test/import', body=exported), (204, None))
+        self.assertEqual(self.http_write('/reservations', raw, 'large'), (200, original))
+
+    def test_large_json_number_in_unknown_move_field_commits_with_receipt(self):
+        original = self.book()[1]
+        raw = json.dumps({'moves': [{'reference': original['reference'], 'table_id': 't2'}]}).encode()[:-1] + b', "extra": 1e309}'
+        status, moved = self.http_write('/reservation-moves', raw, 'large-move')
+        self.assertEqual(status, 201)
+        self.assertEqual(moved['reservations'][0]['table_id'], 't2')
+        self.assertEqual(len(self.api.state['receipts']), 2)
+        self.assertEqual(self.http_write('/reservation-moves', raw, 'large-move'), (200, moved))
+        exported = self.api.request('GET', '/_test/export')[1]
+        self.assertEqual(self.api.request('POST', '/_test/import', body=exported), (204, None))
+        self.assertEqual(self.http_write('/reservation-moves', raw, 'large-move'), (200, moved))
+
+    def test_invalid_json_numeric_constants_and_invalid_changes_leave_state_unchanged(self):
+        for constant in (b'NaN', b'Infinity', b'-Infinity', b'1e999999999999999999999999'):
+            raw = json.dumps(self.body).encode()[:-1] + b', "extra": ' + constant + b'}'
+            before = copy.deepcopy(self.api.state)
+            self.error(self.http_write('/reservations', raw, 'invalid'), 400, 'malformed_request')
+            self.assertTrue(self.api.state == before)
+        original = self.book(key='invalid')[1]
+        invalid = json.dumps({'moves': [{'reference': original['reference'], 'party_size': False}]}).encode()[:-1] + b', "extra": 1e309}'
+        before = copy.deepcopy(self.api.state)
+        self.error(self.http_write('/reservation-moves', invalid, 'invalid-move'), 422, 'validation_failed')
+        self.assertTrue(self.api.state == before)
+        for constant in (b'NaN', b'Infinity', b'-Infinity', b'1e999999999999999999999999'):
+            self.error(self.http_write('/reservation-moves', invalid.replace(b'1e309', constant), 'invalid-move'), 400, 'malformed_request')
+            self.assertTrue(self.api.state == before)
+        valid = json.dumps({'moves': [{'reference': original['reference'], 'table_id': 't2'}]}).encode()
+        self.assertEqual(self.http_write('/reservation-moves', valid, 'invalid-move')[0], 201)
+
+    def test_json_numeric_value_identity_handles_precision_underflow_and_boolean_types(self):
+        raw = json.dumps(self.body).encode()[:-1] + b', "extra": {"small": 1e-400, "precise": 1.0000000000000000001}}'
+        status, original = self.http_write('/reservations', raw, 'precise')
+        self.assertEqual(status, 201)
+        equivalent = raw.replace(b'1e-400', b'10e-401').replace(b'1.0000000000000000001', b'1.00000000000000000010')
+        self.assertEqual(self.http_write('/reservations', equivalent, 'precise'), (200, original))
+        before = copy.deepcopy(self.api.state)
+        for inconsistent in (raw.replace(b'1e-400', b'0'), raw.replace(b'1.0000000000000000001', b'1.0000000000000000002'), raw.replace(b'1e-400', b'true')):
+            self.error(self.http_write('/reservations', inconsistent, 'precise'), 409, 'idempotency_key_reuse')
+            self.assertTrue(self.api.state == before)
+
     def test_public_browsing_authentication_and_account_hashing(self):
         self.assertEqual(self.api.request('GET', '/health'), (200, {'status': 'ok'}))
         self.assertEqual(self.api.request('GET', '/restaurants')[0], 200)
