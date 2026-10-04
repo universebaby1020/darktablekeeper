@@ -102,12 +102,15 @@ async function lateSearchCannotRestoreEarlierGridOrBooking() {
 
 async function uncertainPairRetryUsesOriginalIdentityAndClearsFeedback() {
   const requests = [];
+  let currentRecord;
   const env = environment(async (path, options) => {
+    if (path.startsWith('/reservations/')) return response(currentRecord);
     if (path === '/reservations') {
       requests.push({ key: options.headers['Idempotency-Key'], body: options.body });
       if (requests.length === 1) throw new Error('Response connection lost after submission');
       const body = JSON.parse(options.body);
-      return response({ ...body, reference: 'ORIGIN01', status: 'confirmed' }, 200);
+      currentRecord = { ...body, reference: 'ORIGIN01', status: 'confirmed' };
+      return response(currentRecord, 200);
     }
     return ordinaryFetcher(path);
   });
@@ -236,12 +239,126 @@ async function policyCapacityLabelsFollowAuthoritativeOptions() {
   assert.equal(env.document.querySelector('[data-testid="slot-r1-19:00"]').getAttribute('data-available'), 'true');
 }
 
+async function repairedSingleRetryReadsCurrentSeatingWithoutChangingIdentity() {
+  await repairedConfirmation(['r1'], ['r2']);
+}
+
+async function repairedPairRetryReadsAllCurrentTableLabels() {
+  await repairedConfirmation(['r2', 'r1'], ['r2', 'r3']);
+}
+
+async function repairedConfirmation(originalIds, currentIds) {
+  const requests = [];
+  let details = 0;
+  const place = restaurant();
+  place.tables.push({ id: 'r3', label: 'Terrace', capacity: 4 });
+  place.combinable.push(['r2', 'r3']);
+  const original = { restaurant_id: 'r', table_ids: originalIds, starts_at_local: '2090-01-05T19:00',
+    party_size: originalIds.length === 1 ? 2 : 6, reference: 'REPAIR01', status: 'confirmed' };
+  const latest = { ...original, table_ids: currentIds, revision: 2 };
+  const env = environment(async (path, options) => {
+    if (path === '/restaurants/r') return response(place);
+    if (path === '/reservations') {
+      requests.push({ key: options.headers['Idempotency-Key'], body: options.body });
+      if (requests.length === 1) throw new Error('Booking response lost after commit');
+      return response(original, 200);
+    }
+    if (path === '/reservations/REPAIR01') { details++; return response(latest); }
+    return ordinaryFetcher(path);
+  });
+  await flush(); await env.run('runSearch(' + query('r') + ')');
+  const testid = originalIds.length === 1 ? 'slot-r1-19:00' : 'slot-r2+r1-19:00';
+  env.document.querySelector('[data-testid="' + testid + '"]').onclick();
+  const form = env.document.querySelector('[data-testid="booking-form"]');
+  const input = env.document.querySelector('[data-testid="booking-party-size"]');
+  input.value = String(original.party_size); input.oninput();
+  await env.run('submitBooking({preventDefault(){}})');
+  assert(env.document.querySelector('[data-testid="booking-uncertain"]'));
+  assert.equal(details, 0);
+  await env.run('submitBooking({preventDefault(){}})');
+  assert.deepEqual(requests[0], requests[1]);
+  assert.equal(details, 1);
+  assert.equal(env.document.querySelector('[data-testid="confirmation-reference"]').textContent, original.reference);
+  for (const id of currentIds) {
+    const label = place.tables.find(table => table.id === id).label;
+    assert(env.document.querySelector('[data-testid="confirmation-tables"]').textContent.includes(label));
+    assert(env.document.querySelector('[data-testid="confirmation-details"]').textContent.includes(label));
+  }
+  assert(!env.document.querySelector('[data-testid="confirmation-tables"]').textContent.includes('Window r'));
+  assert.equal(env.document.querySelector('[data-testid="booking-error"]'), null);
+  assert.equal(env.document.querySelector('[data-testid="booking-uncertain"]'), null);
+  assert.equal(env.document.querySelector('[data-testid="booking-form"]'), form);
+  assert.equal(input.value, String(original.party_size));
+  await env.run('submitBooking({preventDefault(){}})');
+  assert.deepEqual(requests[0], requests[2]);
+  assert.equal(details, 2);
+}
+
+async function currentDetailFailuresKeepRetryIdentityAndDoNotShowStaleConfirmation() {
+  for (const failure of ['connection', 'not_found', 'unauthenticated', 'server', 'json', 'mismatch']) {
+    const requests = [];
+    let readCount = 0;
+    const original = { restaurant_id: 'r', table_id: 'r1', starts_at_local: '2090-01-05T19:00',
+      party_size: 2, reference: 'DETAIL01', status: 'confirmed' };
+    const latest = { ...original, table_id: 'r2', revision: 2 };
+    const env = environment(async (path, options) => {
+      if (path === '/reservations') {
+        requests.push({ key: options.headers['Idempotency-Key'], body: options.body });
+        return response(original, requests.length === 1 ? 201 : 200);
+      }
+      if (path === '/reservations/DETAIL01') {
+        if (++readCount > 1) return response(latest);
+        if (failure === 'connection') throw new Error('Current detail connection lost');
+        if (failure === 'json') return { ok: true, status: 200, json: async () => { throw new Error('Incomplete JSON'); } };
+        if (failure === 'mismatch') return response({ ...latest, reference: 'OTHER001' });
+        const status = { not_found: 404, unauthenticated: 401, server: 500 }[failure];
+        return response({ error: { code: failure, message: 'Current details unavailable' } }, status);
+      }
+      return ordinaryFetcher(path);
+    });
+    await flush(); await env.run('runSearch(' + query('r') + ')');
+    env.document.querySelector('[data-testid="slot-r1-19:00"]').onclick();
+    await env.run('submitBooking({preventDefault(){}})');
+    assert.equal(env.document.querySelector('[data-testid="confirmation"]'), null, failure);
+    assert.equal(env.document.querySelector('[data-testid="booking-error"]'), null, failure);
+    assert(env.document.querySelector('[data-testid="booking-uncertain"]').textContent.includes('current seating'), failure);
+    assert.equal(env.document.querySelector('[data-testid="booking-party-size"]').disabled, false);
+    assert.equal(env.document.querySelector('[data-testid="booking-submit"]').disabled, false);
+    await env.run('submitBooking({preventDefault(){}})');
+    assert.deepEqual(requests[0], requests[1], failure);
+    assert.equal(env.document.querySelector('[data-testid="confirmation-reference"]').textContent, original.reference);
+    assert(env.document.querySelector('[data-testid="confirmation-tables"]').textContent.includes('Garden r'));
+    assert.equal(env.document.querySelector('[data-testid="booking-uncertain"]'), null);
+  }
+}
+
+async function lateCurrentDetailsCannotReplaceANewerBookingSelection() {
+  let finish;
+  const original = { restaurant_id: 'r', table_id: 'r1', starts_at_local: '2090-01-05T19:00', party_size: 2, reference: 'LATE001', status: 'confirmed' };
+  const env = environment(async path => {
+    if (path === '/reservations') return response(original, 201);
+    if (path === '/reservations/LATE001') return new Promise(resolve => { finish = () => resolve(response(original)); });
+    return ordinaryFetcher(path);
+  });
+  await flush(); await env.run('runSearch(' + query('r') + ')');
+  env.document.querySelector('[data-testid="slot-r1-19:00"]').onclick();
+  const submission = env.run('submitBooking({preventDefault(){}})');
+  await flush();
+  env.document.querySelector('[data-testid="slot-r2-19:00"]').onclick();
+  finish(); await submission;
+  assert.equal(env.run('selection.body.table_id'), 'r2');
+  assert.equal(env.document.querySelector('[data-testid="confirmation"]'), null);
+  assert(env.document.querySelector('[data-testid="booking-summary"]').textContent.includes('Garden r'));
+}
+
 (async () => {
   for (const test of [lateSearchCannotRestoreEarlierGridOrBooking, uncertainPairRetryUsesOriginalIdentityAndClearsFeedback,
     confirmedConflictRefreshPreservesFormAndInputs, emptySlotsAndSignedOutSelectionHaveExplicitStates,
     lookupCancellationShowsBothLabelsAndFinalStatus, authScreensSubmitFieldsAndKeepAccountNavigationConsistent,
-    policyCapacityLabelsFollowAuthoritativeOptions]) {
+    policyCapacityLabelsFollowAuthoritativeOptions, repairedSingleRetryReadsCurrentSeatingWithoutChangingIdentity,
+    repairedPairRetryReadsAllCurrentTableLabels, currentDetailFailuresKeepRetryIdentityAndDoNotShowStaleConfirmation,
+    lateCurrentDetailsCannotReplaceANewerBookingSelection]) {
     await test(); console.log('PASS ' + test.name);
   }
-  console.log('7 state-flow checks passed; direct browser and visual review NOT_PERFORMED.');
+  console.log('11 state-flow checks passed; direct browser and visual review NOT_PERFORMED.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

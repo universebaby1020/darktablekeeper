@@ -298,8 +298,22 @@ async function submitBooking(event) {
   try {
     const reservation = await api('/reservations', { method: 'POST', headers: { 'Idempotency-Key': pending.key }, body: pending.body });
     if (selection !== current) return;
-    messages.replaceChildren();
-    renderConfirmation(reservation, current.restaurant);
+    // The write receipt is immutable. A seating repair may have changed the booking
+    // since that receipt was recorded, so confirmation uses an authoritative read.
+    button.textContent = 'Checking your reservation…';
+    try {
+      const latest = await api('/reservations/' + encodeURIComponent(reservation.reference));
+      if (selection !== current) return;
+      if (latest.reference !== reservation.reference || latest.restaurant_id !== current.restaurant.id) {
+        throw new Error('Reservation details did not match the confirmation.');
+      }
+      renderConfirmation(latest, current.restaurant);
+      messages.replaceChildren();
+    } catch (_) {
+      if (selection !== current) return;
+      document.getElementById('booking-confirmation').replaceChildren();
+      feedback(messages, 'booking-uncertain', 'Your reservation was confirmed, but we could not load its current seating details. Retry without changing the form to safely view the same reservation.', 'uncertain');
+    }
   } catch (error) {
     if (selection !== current) return;
     if (error instanceof Rejection) {
@@ -322,7 +336,7 @@ async function submitBooking(event) {
 function renderConfirmation(reservation, restaurant) {
   const ids = reservation.table_ids || [reservation.table_id];
   const confirmation = el('div', { class: 'confirmation', 'data-testid': 'confirmation', tabindex: '-1' });
-  confirmation.append(el('p', { class: 'eyebrow' }, 'You’re on the guest list'),
+  confirmation.append(el('p', { class: 'eyebrow' }, reservation.status === 'cancelled' ? 'This reservation is cancelled' : 'You’re on the guest list'),
     el('div', { class: 'reference', 'data-testid': 'confirmation-reference' }, reservation.reference),
     el('p', { 'data-testid': 'confirmation-details' }, restaurant.name + ' · ' + seatingName(restaurant, ids) + ' · ' + localDescription(reservation.starts_at_local)),
     el('p', { 'data-testid': 'confirmation-tables' }, seatingName(restaurant, ids)),
